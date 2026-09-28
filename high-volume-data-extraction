@@ -1,0 +1,201 @@
+# ==============================================================================
+# 1. CONFIGURATION & INPUT VARIABLES
+# ==============================================================================
+
+# The location of the text file containing your list of Jira Ticket IDs (one per line)
+$InputFile = "C:\path\to\your\file" 
+
+# The location where the final CSV file will be saved or appended to
+$CsvPath   = "C:\path\to\your\file"
+
+# Jira Authentication details
+#$UserEmail = "serviceaccount@serviceaccount.atlassian.com"
+$ApiToken  = "apiTokenHere"
+$CloudID   = "cloudID"
+
+# Authentication Header for the API request. 
+$Headers = @{
+    "Authorization" = "Bearer $($ApiToken.Trim())"
+    "Accept"        = "application/json"
+}
+
+
+# ==============================================================================
+# 2. HELPER FUNCTIONS
+# ==============================================================================
+# This function calculates the time difference between two dates, but strictly 
+# ignores weekends (Saturdays/Sundays) and non-working hours (outside 9 AM - 5 PM).
+function Get-BusinessMinutes {
+    param (
+        [Parameter(Mandatory = $true)][datetime]$StartTime,
+        [Parameter(Mandatory = $true)][datetime]$EndTime,
+        
+        # Define standard business hours. These can be adjusted if needed.
+        [TimeSpan]$BusinessStart = (New-TimeSpan -Hours 9 -Minutes 0),
+        [TimeSpan]$BusinessEnd   = (New-TimeSpan -Hours 17 -Minutes 0)
+    )
+
+    # If for some reason the reply time is before the creation time, return 0.
+    if ($StartTime -ge $EndTime) { return 0 }
+
+    $totalBusinessMinutes = 0
+    $currentDate = $StartTime.Date
+
+    # Loop through each calendar day between the start date and the end date
+    while ($currentDate -le $EndTime.Date) {
+        
+        # Check if the current day in the loop is a weekend. If so, skip to the next day.
+        if ($currentDate.DayOfWeek -in 'Saturday', 'Sunday') {
+            $currentDate = $currentDate.AddDays(1)
+            continue
+        }
+
+        # Establish the exact 9 AM and 5 PM timestamps for the current day in the loop
+        $windowStart = $currentDate.Add($BusinessStart)
+        $windowEnd   = $currentDate.Add($BusinessEnd)
+
+        # "Clamp" the Start Time: 
+        # If the ticket was created before 9 AM, we pretend it was created exactly at 9 AM.
+        # Otherwise, use the actual creation time.
+        $segmentStart = if ($StartTime -gt $windowStart) { $StartTime } else { $windowStart }
+        
+        # "Clamp" the End Time:
+        # If the ticket was replied to after 5 PM, we stop counting at 5 PM.
+        # Otherwise, use the actual reply time.
+        $segmentEnd   = if ($EndTime -lt $windowEnd) { $EndTime } else { $windowEnd }
+
+        # Calculate the minutes for this specific day and add it to our running total
+        if ($segmentStart -lt $segmentEnd) {
+            $totalBusinessMinutes += ($segmentEnd - $segmentStart).TotalMinutes
+        }
+
+        # Move to the next day in the loop
+        $currentDate = $currentDate.AddDays(1)
+    }
+
+    # Round to the nearest whole minute and return the final number
+    return [math]::Round($totalBusinessMinutes, 0)
+}
+
+
+# ==============================================================================
+# 3. READ FILE & BEGIN TICKET PROCESSING
+# ==============================================================================
+# Read the text file containing the Ticket IDs. 
+$testInventory = Get-Content -Path $InputFile | Where-Object { ![string]::IsNullOrWhiteSpace($_) }
+
+# Start a loop to process every single Ticket ID found in the text file
+foreach ($TicketId in $testInventory) {
+    
+    # Trim the Ticket ID to remove any invisible spaces that might break the URL
+    $TicketId = $TicketId.Trim()
+    
+    # Dynamically build the API URL for this specific ticket
+    $ApiEndpoint = "https://api.atlassian.com/ex/jira/$CloudID/rest/api/3/issue/$TicketId"
+
+    # If Jira returns an error (like "Ticket Not Found" or "Unauthorized"), 
+    # the script won't crash. It will jump to the Catch block, log the error, and move to the next ticket.
+    try {
+        Write-Host "Fetching ticket information for $TicketId..." -ForegroundColor Cyan
+        
+        # Execute the API Call. PowerShell will automatically convert the JSON response into a usable object.
+        $Response = Invoke-RestMethod -Uri $ApiEndpoint -Headers $Headers -Method Get
+        Write-Host "Successfully retrieved ticket details!" -ForegroundColor Green
+
+
+        # ==============================================================================
+        # 4. EXTRACT CUSTOM METRICS
+        # ==============================================================================
+        
+        # Grab the current status of the ticket (e.g., "In Progress", "Closed")
+        $ticketStatus = $Response.fields.status.name
+
+        # Safely grab the Assignee. If a ticket has no assignee, reading .emailAddress throws an error.
+        if ($null -ne $Response.fields.assignee) {
+            $assigneeEmail = $Response.fields.assignee.emailAddress
+        } else {
+            $assigneeEmail = "Unassigned"
+        }
+
+        # Safely grab the Campaign Manager (Custom Field). Handled exactly like the Assignee.
+        if ($null -ne $Response.fields.customfield_10072) {
+            $campaignManager = $Response.fields.customfield_10072.emailAddress
+        } else {
+            $campaignManager = "None"
+        }
+
+        # Extract the Creation Date and use Regex to grab just the YYYY-MM-DD portion
+        $timeCreated = $Response.fields.created
+        $Regex = "\d{4}-\d{2}-\d{2}"
+        if ($timeCreated -match $Regex) {
+            $creationDate = $matches[0]
+        }
+
+        # Setup default values for the Response Time in case nobody has replied yet
+        $replyTime = $null
+        $responseTime = "No reply yet"
+
+        # Check if the ticket actually has any comments on it.
+        if ($Response.fields.comment.total -gt 0) {
+            # Filter the comments to only look at ones made by an "atlassian" account type
+            # Grab the very first one chronologically, and extract its creation timestamp.
+            $replyTime = $Response.fields.comment.comments | 
+                Where-Object { $_.author.accounttype -eq "atlassian" } | 
+                Select-Object -First 1 -ExpandProperty created
+        }
+
+        # If we successfully found a valid reply time, calculate the business hours it took to respond
+        if ($null -ne $replyTime) {
+            $responseTime = Get-BusinessMinutes -StartTime ([datetime]$timeCreated) -EndTime ([datetime]$replyTime)
+        }
+
+
+        # ==============================================================================
+        # 5. EXPORT DATA TO CSV
+        # ==============================================================================
+        
+        # Bundle all of our extracted variables into a clean, structured Custom Object
+        $TicketRecord = [PSCustomObject]@{
+            TicketID          = $TicketId
+            Status            = $ticketStatus
+            Assignee          = $assigneeEmail
+            CampaignManager   = $campaignManager
+            CreationDate      = $creationDate
+            ResponseTime_Mins = $responseTime
+        }
+
+        # Export the Custom Object to the CSV file. 
+        $TicketRecord | Export-Csv -Path $CsvPath -Append -NoTypeInformation
+        
+        Write-Host "Ticket $TicketId successfully appended to $CsvPath`n" -ForegroundColor Green
+    }
+    catch {
+        # ==============================================================================
+        # 6. ERROR HANDLING
+        # ==============================================================================
+        # If anything in the Try block fails, the script jumps here.
+        Write-Error "Failed to retrieve Jira ticket $TicketId."
+        Write-Error "Error details: $_"
+        
+        # Jira often sends detailed error reasons inside the HTTP response body. 
+        # This block digs into the raw HTTP error to print out exactly what Jira complained about.
+        if ($_.Exception.Response) {
+            $ErrorResponse = $_.Exception.Response.GetResponseStream()
+            $Reader = New-Object System.IO.StreamReader($ErrorResponse)
+            $Reader.BaseStream.Position = 0
+            $Reader.DiscardBufferedData()
+            $ResponseBody = $Reader.ReadToEnd()
+            Write-Error "Jira API Response Body: $ResponseBody`n"
+        }
+    }
+
+    # ==============================================================================
+    # 7. RATE LIMITING TIMER
+    # ==============================================================================
+    # Pause the script for 2 seconds before looping back to the top. 
+    Write-Host "Pausing for 2 seconds to prevent API rate limiting..." -ForegroundColor DarkGray
+    Start-Sleep -Seconds 2
+}
+
+# The loop has finished running through every ticket in the text file.
+Write-Host "All processing complete!" -ForegroundColor Cyan
